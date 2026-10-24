@@ -13,7 +13,7 @@ type User struct {
 }
 
 func LearnCode() {
-	db := database.InitDB04()
+	db, _ := database.InitDB("04_learn")
 
 	dryDB := db.Session(&gorm.Session{DryRun: true})
 

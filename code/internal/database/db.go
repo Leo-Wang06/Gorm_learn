@@ -1,6 +1,7 @@
 package database
 
 import (
+	"fmt"
 	"log"
 	"time"
 
@@ -8,8 +9,21 @@ import (
 	"gorm.io/gorm"
 )
 
-func InitDB04() *gorm.DB {
-	dsn := "root:root123456@tcp(127.0.0.1:3306)/04_learn?charset=utf8mb4&parseTime=True&loc=Local"
+const (
+	dbUser = "root"
+	dbPass = "root123456"
+	dbAddr = "127.0.0.1:3306"
+)
+
+func DSN(dbName string) string {
+	return fmt.Sprintf(
+		"%s:%s@tcp(%s)/%s?charset=utf8mb4&parseTime=True&loc=Local",
+		dbUser, dbPass, dbAddr, dbName,
+	)
+}
+
+func InitDB(dbName string) (*gorm.DB, error) {
+	dsn := DSN(dbName)
 
 	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	if err != nil {
@@ -31,5 +45,5 @@ func InitDB04() *gorm.DB {
 		log.Fatal("数据库 Ping 失败：", err)
 	}
 
-	return db
+	return db, nil
 }
