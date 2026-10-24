@@ -3,10 +3,12 @@ package database
 import (
 	"fmt"
 	"log"
+	// "os"
 	"time"
 
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 const (
@@ -25,7 +27,20 @@ func DSN(dbName string) string {
 func InitDB(dbName string) (*gorm.DB, error) {
 	dsn := DSN(dbName)
 
-	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{
+		SkipDefaultTransaction: true,  // 关闭默认事务，提升性能
+		PrepareStmt:            false, // 开发时不缓存，方便调试
+		Logger: logger.Default.LogMode(logger.Info),
+		// Logger: logger.New(
+		// 	log.New(os.Stdout, "\r\n", log.LstdFlags),
+		// 	logger.Config{
+		// 		SlowThreshold:             200 * time.Millisecond,
+		// 		LogLevel:                  logger.Info,  // 开发：打印所有 SQL
+		// 		IgnoreRecordNotFoundError: false,
+		// 		Colorful:                  true,
+		// 	},
+		// ),
+	})
 	if err != nil {
 		log.Fatal("数据库连接失败：", err)
 	}
