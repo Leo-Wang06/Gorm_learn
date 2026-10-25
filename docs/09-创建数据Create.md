@@ -205,7 +205,7 @@ user := User{ID: 1, Name: "张三（已更新）", Age: 26}
 
 db.Clauses(clause.OnConflict{
 	UpdateAll: true,  // 冲突时更新所有字段
-}).Create(&user)
+}).Create(&user) 	
 ```
 
 MySQL 生成的 SQL：
