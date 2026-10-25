@@ -5,7 +5,8 @@ import (
 	// "learn/internal/chapter05"
 	// "learn/internal/chapter07"
 	// "learn/internal/chapter08"
-	"learn/internal/chapter09"
+	// "learn/internal/chapter09"
+	"learn/internal/chapter10"
 )
 
 func main() {
@@ -13,6 +14,7 @@ func main() {
 	// chapter05.LearnCode()
 	// chapter07.LearnCode()
 	// chapter08.LearnCode()
-	chapter09.LearnCode()
+	// chapter09.LearnCode()
+	chapter10.LearnCode()
 	
 }

@@ -259,6 +259,7 @@ fmt.Println(user.Name)  // 只需要 Name，却查了所有字段
 var user User
 db.Select("name").First(&user, 1)
 fmt.Println(user.Name)
+
 // SQL: SELECT `name` FROM `users` WHERE id=1 LIMIT 1
 
 // ✅ 更好：只查一列
