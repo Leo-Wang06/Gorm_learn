@@ -195,7 +195,7 @@ db.Model(&user).Updates(map[string]interface{}{
 db.Model(&article).UpdateColumn("views", gorm.Expr("views + 1"))
 
 // 字符串拼接
-db.Model(&user).Update("full_name", gorm.Expr("CONCAT(first_name, ' ', last_name)"))
+db.Model(&user).Update("full_name", gorm.Expr(" (first_name, ' ', last_name)"))
 
 // 使用 IF 条件
 db.Model(&user).Update("status", gorm.Expr("IF(age > 18, 'adult', 'minor')"))
