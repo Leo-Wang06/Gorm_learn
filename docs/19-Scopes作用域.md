@@ -65,21 +65,25 @@ db.Scopes(ActiveUsers).Count(&count)
 
 ```go
 func Paginate(page, pageSize int) func(db *gorm.DB) *gorm.DB {
+	// 先规范输入并限制 pageSize；实际 API 还应对超大 page 做范围/溢出校验。
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		pageSize = 10
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+	offset := (page - 1) * pageSize
 	return func(db *gorm.DB) *gorm.DB {
-		if page <= 0 {
-			page = 1
-		}
-		if pageSize <= 0 || pageSize > 100 {
-			pageSize = 10
-		}
-		offset := (page - 1) * pageSize
 		return db.Offset(offset).Limit(pageSize)
 	}
 }
 
-// 使用
-db.Scopes(Paginate(2, 10)).Find(&users)
-// SQL: SELECT * FROM `users` LIMIT 10 OFFSET 10
+// 使用：分页查询配合稳定排序
+db.Order("id ASC").Scopes(Paginate(2, 10)).Find(&users)
+// SQL: SELECT * FROM `users` ORDER BY id ASC LIMIT 10 OFFSET 10
 ```
 
 ### 状态过滤 Scope
@@ -116,9 +120,13 @@ db.Scopes(CreatedBetween(weekAgo, time.Now())).Find(&users)
 
 ## 19.3 Scope 的组合
 
-多个 Scope 可以链式组合：
+多个 Scope 可以链式组合。此处的 `ActiveUsers`、`Paginate`、`CreatedBetween` 定义见前文；下面补充 `AdultUsers`：
 
 ```go
+func AdultUsers(db *gorm.DB) *gorm.DB {
+	return db.Where("age >= ?", 18)
+}
+
 // 查询最近一周创建的活跃成年用户，分页展示
 db.Scopes(
 	ActiveUsers,                         // status = 'active'
@@ -162,6 +170,24 @@ func WithMinAge(minAge int) func(db *gorm.DB) *gorm.DB {
 		return db
 	}
 }
+
+func WithMaxAge(maxAge int) func(db *gorm.DB) *gorm.DB {
+	return func(db *gorm.DB) *gorm.DB {
+		if maxAge > 0 {
+			return db.Where("age <= ?", maxAge)
+		}
+		return db
+	}
+}
+
+func WithCity(city string) func(db *gorm.DB) *gorm.DB {
+	return func(db *gorm.DB) *gorm.DB {
+		if city != "" {
+			return db.Where("city = ?", city)
+		}
+		return db
+	}
+}
 ```
 
 ### 实际场景：复杂搜索 API
@@ -181,7 +207,7 @@ func SearchUsers(db *gorm.DB, params UserSearchParams) ([]User, int64, error) {
 	var users []User
 	var total int64
 
-	query := db.Model(&User{}).Scopes(
+	baseQuery := db.Model(&User{}).Scopes(
 		WithKeyword(params.Keyword),
 		WithStatus(params.Status),
 		WithMinAge(params.MinAge),
@@ -189,15 +215,17 @@ func SearchUsers(db *gorm.DB, params UserSearchParams) ([]User, int64, error) {
 		WithCity(params.City),
 	)
 
-	// 先统计总数
-	query.Count(&total)
+	if err := baseQuery.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
 
-	// 再查分页数据
-	err := query.Scopes(Paginate(params.Page, params.PageSize)).
-		Order("created_at desc").
+	err := baseQuery.Scopes(Paginate(params.Page, params.PageSize)).
+		Order("created_at DESC, id DESC").
 		Find(&users).Error
-
-	return users, total, err
+	if err != nil {
+		return nil, 0, err
+	}
+	return users, total, nil
 }
 ```
 
@@ -208,6 +236,7 @@ func SearchUsers(db *gorm.DB, params UserSearchParams) ([]User, int64, error) {
 ```go
 // ============ 过滤类 ============
 
+// 列名不能用 ? 占位符绑定。调用这类通用 Scope 前，必须由调用方把 column 限制为可信白名单。
 func WhereLike(column, keyword string) func(db *gorm.DB) *gorm.DB {
 	return func(db *gorm.DB) *gorm.DB {
 		if keyword != "" {
@@ -240,22 +269,34 @@ func WhereDateBetween(column string, start, end *time.Time) func(db *gorm.DB) *g
 
 // ============ 排序类 ============
 
+// field 必须由调用方通过白名单校验；列名不可作为普通 SQL 参数绑定。
 func OrderBy(field string, desc bool) func(db *gorm.DB) *gorm.DB {
 	return func(db *gorm.DB) *gorm.DB {
-		if desc {
-			return db.Order(field + " desc")
+		order := clause.OrderByColumn{
+			Column: clause.Column{Name: field},
+			Desc:   desc,
 		}
-		return db.Order(field + " asc")
+		return db.Order(order)
 	}
 }
+
+// import "gorm.io/gorm/clause"
 
 // ============ 分页类 ============
 
 func Paginate(page, pageSize int) func(db *gorm.DB) *gorm.DB {
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		pageSize = 10
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+	offset := (page - 1) * pageSize
 	return func(db *gorm.DB) *gorm.DB {
-		if page <= 0 { page = 1 }
-		if pageSize <= 0 { pageSize = 10 }
-		return db.Offset((page - 1) * pageSize).Limit(pageSize)
+		return db.Offset(offset).Limit(pageSize)
 	}
 }
 
@@ -275,13 +316,12 @@ func WithPreload(associations ...string) func(db *gorm.DB) *gorm.DB {
 
 ## 19.6 Scope 中的 DB 操作（小心！）
 
-Scope 不仅能加查询条件，还能做更多事：
+Scope 通常应描述查询构造，不应执行独立副作用或假设 SQL 已经生成：
 
 ```go
-// Scope 中执行额外操作（不推荐，但有时有用）
+// 不要在 Scope 构造阶段读取 db.Statement.SQL：此时通常还没有执行 SQL。
+// 审计/查询日志应使用 GORM Logger、插件或回调，在 SQL 构建/执行阶段记录。
 func AuditLog(db *gorm.DB) *gorm.DB {
-	// 记录查询日志
-	log.Printf("执行查询: %s", db.Statement.SQL.String())
 	return db
 }
 

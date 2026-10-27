@@ -12,10 +12,13 @@
 ## 前置知识
 - 需要先学习：第11章（WHERE 条件查询）
 - 需要了解：MySQL JOIN 语法（INNER JOIN、LEFT JOIN）
+- 关联名 Join（如 `Joins("Company")`）依赖模型关联定义；相关关系会在第21-25章系统讲解。前文尚未学习关联时，先使用显式 JOIN 与 ON 条件。
 
 ---
 
-## 17.1 `Joins`：左外连接
+## 17.1 `Joins`：显式连接查询
+
+> 📌 `Joins("LEFT JOIN ...")` 的连接类型由 SQL 字符串决定；`Joins("Company")` 是基于已定义关联的 Join，默认生成 LEFT JOIN。不要把 `Joins` 方法本身理解成固定的左连接。
 
 ### 字符串 Join
 
@@ -41,7 +44,7 @@ db.Joins("LEFT JOIN companies ON users.company_id = companies.id").
 
 ### 扫描到自定义结构体
 
-Join 的结果通常不只是 `users` 表的字段，还包含关联表的字段：
+使用显式 JOIN 时，普通 `Find(&users)` 主要扫描 `users` 模型字段，不会自动把任意别名列映射到嵌套关联。若要把关联表的额外列放进结果，可用自定义结构体和 `Scan`：
 
 ```go
 // 自定义结构体接收 Join 结果
@@ -185,11 +188,11 @@ db.Model(&Employee{}).
 
 | 特性 | Joins | Preload |
 |------|-------|---------|
-| SQL 条数 | 1 条（JOIN） | 多条（主查询 + 关联查询） |
-| 结果组装 | 需要自义结构体 + Scan | 自动填充关联字段 |
-| 关联条件查询 | ✅ 可以 | ❌ 不能（Preload 不参与主查询过滤） |
-| 一对多/多对多 | ❌ 结果会膨胀 | ✅ 正确组装嵌套数据 |
-| 适用场景 | 需要 JOIN 过滤或统计 | 纯展示关联数据 |
+| SQL 条数 | 通常 1 条 JOIN 查询 | 主查询 + 关联查询（常见为 2 条，关联层级/类型会影响条数） |
+| 结果组装 | 普通列可扫描到平铺结构体；嵌套关联 Join 可由 GORM 按关联映射 | 自动填充关联字段 |
+| 关联条件查询 | 可在 JOIN/WHERE 条件中筛选主记录 | 普通 Preload 不参与主查询过滤；可单独给预加载查询加条件 |
+| 一对多/多对多 | JOIN 行会按关联记录展开；分页和计数需谨慎 | 自动按外键组装嵌套集合，通常更适合加载完整关联 |
+| 适用场景 | 需要单条 SQL、关联表过滤或平铺报表 | 需要按模型关联加载嵌套数据 |
 
 ```go
 // 场景1：需要过滤"在 Google 工作的用户" → 用 Joins
@@ -203,29 +206,52 @@ db.Preload("Company").Find(&users)
 
 ## 常见错误
 
-### 错误1：Join 后 SELECT * 导致字段歧义
+### 错误1：把关联表额外列误以为会自动填入模型
 
 ```go
-// ❌ 两张表都有 name 字段，结果不确定
+// 这会查询 User 模型列；不会自动把 Company.Name 写入自定义字段 CompanyName。
 db.Joins("Company").Find(&users)
 
-// ✅ 用 Select 明确字段来源
-db.Select("users.*, companies.name AS company_name").
-   Joins("LEFT JOIN companies ON users.company_id = companies.id").
-   Scan(&customStruct)
+// ✅ 需要平铺结果时明确列与别名，并 Scan 到匹配的结构体
+type UserCompanyRow struct {
+	ID          uint
+	Name        string
+	CompanyName string
+}
+var rows []UserCompanyRow
+if err := db.Model(&User{}).
+	Select("users.id AS id, users.name AS name, Company.name AS company_name").
+	Joins("Company").
+	Scan(&rows).Error; err != nil {
+	return err
+}
 ```
+
+> 📌 多个 JOIN 表含有同名列时，要使用表限定名；别名应与目标字段名对应。
 
 ### 错误2：用 Joins 做一对多查询导致数据膨胀
 
 ```go
-// 一个用户有 10 个订单
-// Joins 结果：用户数据重复 10 次
-db.Joins("Orders").Find(&users)
-// ❌ 每个用户出现 10 次（和每个订单组合成一行）
+// 一个用户有 10 个订单。显式一对多 JOIN 的 SQL 结果会有 10 行用户-订单组合；
+// 直接 Find 到 []User 不应被当成可靠的“自动组装 Orders”方式。
+type UserOrderRow struct {
+	UserID    uint
+	UserName  string
+	OrderID   uint
+	Amount    float64
+}
+var rows []UserOrderRow
+if err := db.Model(&User{}).
+	Select("users.id AS user_id, users.name AS user_name, orders.id AS order_id, orders.amount").
+	Joins("LEFT JOIN orders ON orders.user_id = users.id").
+	Scan(&rows).Error; err != nil {
+	return err
+}
 
-// 一对多 → 用 Preload
-db.Preload("Orders").Find(&users)
-// ✅ 每个用户出现 1 次，Orders 嵌套在 Orders 字段里
+// 若目标是得到每个用户一次、并将订单组装到关联切片中，用 Preload。
+if err := db.Preload("Orders").Find(&users).Error; err != nil {
+	return err
+}
 ```
 
 ### 错误3：忘记 `Model()`
@@ -257,4 +283,4 @@ db.Model(&User{}).Joins("LEFT JOIN companies ON ...").Find(&users)
 3. 使用关联名 Join（如果你已经定义了关联关系）查询用户及其公司。
 4. 写一个自连接查询：查询每个员工及其直属上级的姓名。
 5. 对比 Joins 和 Preload 的实现差异：分别用它们查询用户-订单数据，观察生成的 SQL。
-6. （思考题）什么时候绝对不能用 Joins 而必须用 Preload？为什么？
+6. （思考题）哪些场景更适合用 `Preload` 而不是 JOIN？哪些情况下 JOIN 更合适？说明基数、结果形状和分页对选择的影响。
