@@ -1,6 +1,8 @@
 package chapter18
 
 import (
+	"database/sql"
+	"fmt"
 	"learn/internal/database"
 	"log"
 
@@ -84,6 +86,34 @@ func LearnCode() {
 	db.Model(&User{}).
 		Select("name, (SELECT COUNT(*) FROM orders WHERE orders.user_id = users.id) as order_count").
 		Scan(&results2)
+
+	rows, err := db.Model(&User{}).Where("age > ?", 18).Rows()
+	fmt.Println("rows:", rows)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var user User
+		
+		if err := db.ScanRows(rows, &user); err != nil {
+			log.Fatal(err)
+		}
+
+		fmt.Println(user.Name)
+	}
+	if err := rows.Err(); err != nil {
+		log.Fatal(err)
+	}
+
+	var users []User
+
+	db.Where("name = @name AND age > @minAge AND age < @maxAge",
+		sql.Named("name", "张三"),
+		sql.Named("minAge", 18),
+		sql.Named("maxAge", 60),
+	).Find(&users)
 
 }
 
