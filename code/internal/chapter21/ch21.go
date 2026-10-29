@@ -19,7 +19,7 @@ type User struct {
 }
 
 func LearnCode() {
-	db, _ := database.InitDB("19_learn")
+	db, _ := database.InitDB("21_learn")
 
 	if err := db.AutoMigrate(&Company{}, &User{}); err != nil {
 		log.Fatal("建表失败：", err)
