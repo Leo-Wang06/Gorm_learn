@@ -73,27 +73,30 @@ db.Model(&user).Association("Orders").Delete(&order1)
 
 | 关联类型 | Delete 行为 |
 |---------|-----------|
-| BelongsTo | 外键设为 NULL |
-| HasOne | 外键设为 NULL |
-| HasMany | 外键设为 NULL（默认） |
+| BelongsTo | 从源记录移除该归属关系，更新源记录上的外键字段 |
+| HasOne | 解除关联，通常清空关联侧外键 |
+| HasMany | 解除关联，通常清空子记录外键 |
 | Many2Many | 删除中间表记录 |
+
+> HasOne/HasMany 解除关联通常需要将关联侧外键设为 `NULL`。若数据库列有 `NOT NULL` 约束，`Delete`、`Clear` 或 `Replace` 可能失败；这些操作不会自动删除子记录。
 
 ### Replace：替换关联
 
 ```go
-// 用新列表替换全部关联
+// 用新列表替换全部关联；旧订单仅解除关联，不会被删除
+// 此 HasMany 示例要求 orders.user_id 可为 NULL，否则清除旧关联可能失败。
 newOrders := []Order{{Amount: 500}, {Amount: 600}}
 db.Model(&user).Association("Orders").Replace(&newOrders)
-// 1. 清除旧关联（外键设为 NULL）
+// 1. 清除旧关联
 // 2. 设置新关联
 ```
 
 ### Clear：清空所有关联
 
 ```go
-// 清空所有关联
+// 清空所有关联；HasMany 示例要求 orders.user_id 可为 NULL
 db.Model(&user).Association("Orders").Clear()
-// HasMany: UPDATE orders SET user_id = NULL WHERE user_id = 1
+// HasMany: 清空子记录上的外键（不删除订单记录）
 // Many2Many: DELETE FROM student_courses WHERE student_id = 1
 ```
 
@@ -235,21 +238,22 @@ count := db.Model(&student).Association("Courses").Count()
 
 ## 常见错误
 
-### 错误1：Append 已经存在关联的记录
+### 错误1：误以为重复 Append 一定产生重复关联
 
 ```go
-// user 已经有 order1 的关联
-db.Model(&user).Association("Orders").Append(order1)
-// 不会报错，但会产生重复关联（如果外键允许）
-// 对于 Many2Many：中间表插入重复记录！
+// Many2Many 默认中间表通常对两个外键建立复合主键/唯一约束，
+// 因此同一学生-课程组合不能重复插入；重复操作的具体结果仍应检查 Error。
+db.Model(&student).Association("Courses").Append(&course)
 ```
+
+> 自定义中间表若没有对外键组合设置主键或唯一索引，就可能保存重复关联。HasMany 的 Append 则会更新子记录外键，应避免把同一条子记录错误地挂到不同父记录上。
 
 ### 错误2：混淆 Delete 和删除记录
 
 ```go
-// Association Delete：只删除关联（user_id 设为 NULL）
+// Association Delete：解除关联，不删除订单；通常会清空子记录上的外键
 db.Model(&user).Association("Orders").Delete(&order)
-// SQL: UPDATE `orders` SET `user_id`=NULL WHERE `id`=?
+// 若 orders.user_id 为 NOT NULL，此解除关联操作可能失败
 
 // db.Delete：删除记录本身
 db.Delete(&order)

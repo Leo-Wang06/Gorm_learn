@@ -16,7 +16,7 @@
 
 ## 23.1 HasMany：有一个对多个
 
-HasMany 表示"A 拥有多个 B"，外键在 B 表中（和 HasOne 一样，但没有 UNIQUE 约束）：
+HasMany 表示"A 有多个 B"，外键在 B 表中。与 HasOne 一样，外键列位于子表；数据库是否允许多个子记录指向同一父记录，取决于该列上的约束（HasMany 通常不设 UNIQUE）：
 
 ```
 ┌──────────┐         ┌──────────┐
@@ -104,7 +104,7 @@ db.Create(&order2)
 ### 方式二：通过关联对象创建
 
 ```go
-// 创建用户时同时创建订单
+// 创建用户时同时创建非零值关联订单（Create 默认会保存关联）
 user := User{
 	Name: "张三",
 	Orders: []Order{
@@ -113,12 +113,15 @@ user := User{
 		{Amount: 300},
 	},
 }
-db.Select("Orders").Create(&user)  // 同时创建 User 和 Orders
+if err := db.Create(&user).Error; err != nil {
+	panic(err)
+}
+// 需要显式控制参与创建的字段时，可用 db.Select("Name", "Orders").Create(&user)
 
-// 给已有用户追加订单
-var user User
-db.First(&user, 1)
-db.Model(&user).Association("Orders").Append(
+// 给已有用户追加订单：Association 的完整语义见第26章
+var existingUser User
+db.First(&existingUser, 1)
+db.Model(&existingUser).Association("Orders").Append(
 	&Order{Amount: 400},
 	&Order{Amount: 500},
 )
@@ -152,17 +155,18 @@ db.Preload("Orders", "amount > ?", 100).Find(&users)
 db.Preload("Orders", func(db *gorm.DB) *gorm.DB {
 	return db.Order("amount desc").Limit(5)
 }).Find(&users)
-```
+// 注意：此 Limit(5) 限制本次关联查询返回的总订单数，不是每个用户各取 5 条。
+// 若要对每个用户分别取前 5 条，需使用按分组排名的 SQL 等方案。
 
-### 用 Joins 查询有订单的用户
+### 用 JOIN 查询有订单的用户
 
 ```go
-// 查有订单的用户（用 DISTINCT 去重）
+// 用显式 JOIN 过滤有订单的用户，并对主表列去重
 var users []User
-db.Joins("Orders").Distinct().Find(&users)
-// 等价于：SELECT DISTINCT users.* FROM users
-//         JOIN orders ON users.id = orders.user_id
+db.Joins("JOIN orders ON orders.user_id = users.id").Distinct().Find(&users)
 ```
+
+> HasMany 是集合关联。关联名 `Joins("Orders")` 不应当当作 `Preload` 的替代品来组装 `Orders` 切片；需要关联集合时用 `Preload("Orders")`。
 
 ---
 
@@ -188,7 +192,8 @@ db.Create(&Order{Amount: 600, UserID: user.ID})
 ### 替换关联
 
 ```go
-// 把用户的订单替换为新列表（旧订单的 user_id 被清空）
+// 把用户关联替换为新列表；旧订单会解除关联，新订单会关联到该用户
+// 这要求 orders.user_id 允许 NULL，否则解除旧关联可能因 NOT NULL 约束失败。
 newOrders := []Order{
 	{Amount: 800},
 	{Amount: 900},
@@ -199,11 +204,13 @@ db.Model(&user).Association("Orders").Replace(&newOrders)
 ### 删除关联
 
 ```go
-// 删除特定订单的关联（把 user_id 设为 NULL，不删除记录）
+// 解除特定订单与用户的关联，不删除订单记录
 db.Model(&user).Association("Orders").Delete(&order1)
 
-// 清空所有关联（把所有订单的 user_id 设为 NULL）
+// 清空该用户的所有订单关联，不删除订单记录
 db.Model(&user).Association("Orders").Clear()
+// HasMany 解除关联通常需要将 orders.user_id 置为 NULL；列若为 NOT NULL，操作可能失败。
+// 如果业务要求必须保留 user_id，应显式更新为其他有效值或删除订单记录。
 ```
 
 ### 统计关联数量
@@ -288,19 +295,21 @@ func main() {
 
 ## 常见错误
 
-### 错误1：一对多用 Preload，N+1 问题
+### 错误1：忘记 Preload，关联字段未加载
 
 ```go
-// ❌ 不 Preload 却在循环中访问 Orders
+// ❌ 普通 Find 只查询 users，不会填充 Orders
 var users []User
 db.Find(&users)
 for _, u := range users {
-	fmt.Println(len(u.Orders))  // Orders 为空！没有 Preload
+	fmt.Println(len(u.Orders))  // 通常为 0；这里没有发出订单查询
 }
 
 // ✅ 加 Preload
 db.Preload("Orders").Find(&users)
 ```
+
+> 这属于关联数据未加载，不是 N+1。只有在循环中针对每个用户单独查询订单时，才会形成 N+1 查询。
 
 ### 错误2：Association 和 Preload 混淆
 

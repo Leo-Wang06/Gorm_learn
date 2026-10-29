@@ -113,6 +113,8 @@ db.Preload("Orders", func(db *gorm.DB) *gorm.DB {
 // SQL: SELECT * FROM `orders`
 //      WHERE user_id IN (1,2,...) AND status='paid'
 //      ORDER BY amount DESC LIMIT 5
+// 注意：Limit(5) 限制的是这次关联查询的总行数，不是每个用户各取 5 条。
+// 若要每个用户各取前 5 条，需要按 user_id 分组排名等 SQL 方案。
 ```
 
 ---
@@ -157,8 +159,10 @@ db.Joins("Company").Find(&users)
 ```go
 // Joins + Preload（混合使用）
 db.Joins("Company").Preload("Orders").Find(&users)
-// Company 用 JOIN（1条SQL），Orders 用 Preload（+1条SQL）
+// Company 是一对一关联，使用 JOIN；Orders 使用额外的 Preload 查询
 ```
+
+> 关联名 Join 主要用于 BelongsTo/HasOne 等一对一关联。对 HasMany/Many2Many 使用 JOIN 会让主记录按关联行展开，不应当作自动组装关联切片的通用替代方案。
 
 ---
 
@@ -166,11 +170,11 @@ db.Joins("Company").Preload("Orders").Find(&users)
 
 | 维度 | Preload | Joins |
 |------|---------|-------|
-| SQL 条数 | 1 + N（N=关联表数） | 1 条 |
+| SQL 条数 | 主查询 + 每个预加载层级/关联一次查询（嵌套关系会增加查询） | 单条 JOIN 查询（混用 Preload 时仍有额外查询） |
 | 适用关联类型 | 全部（BelongsTo/HasOne/HasMany/Many2Many） | 主要 BelongsTo/HasOne |
-| 一对多/多对多 | ✅ 正确（ORM 层组装） | ❌ 结果膨胀（行重复） |
+| 一对多/多对多 | ✅ 按外键组装到关联集合 | ⚠️ JOIN 会展开为多行，不应当作自动组装关联集合的通用方式 |
 | 关联过滤 | ❌ 不能参与主查询过滤 | ✅ 可以在 WHERE 中使用 |
-| 关联排序 | ✅ 可以在 func 中自定义 | ❌ 会影响主查询的排序 |
+| 关联排序 | ✅ 可以在预加载查询中排序（Limit 是关联查询整体的限制） | 排序发生在 JOIN 结果上，可能影响主结果顺序 |
 
 ### 选择决策
 
@@ -190,13 +194,15 @@ db.Joins("Company").Preload("Orders").Find(&users)
 GORM 支持自动预加载所有关联：
 
 ```go
-// 这个用户模型定义了哪些关联，全部自动预加载
+import "gorm.io/gorm/clause"
+
+// 当前模型定义的直接关联会被预加载
 db.Preload(clause.Associations).Find(&users)
-// 等价于：
+// 可显式列出直接关联：
 db.Preload("Company").Preload("Orders").Preload("Profile").Find(&users)
 ```
 
-> ⚠️ 谨慎使用：会加载所有关联（包括不需要的），浪费性能。
+> `clause.Associations` 不会递归预加载嵌套关联；例如 `Orders.Items` 仍需显式写 `Preload("Orders.Items")`。谨慎使用：它会加载当前模型的所有直接关联，包括此处用不到的关联。
 
 ---
 

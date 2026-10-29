@@ -88,7 +88,7 @@ type Student struct {
 
 | 标签 | 含义 | 默认值 |
 |------|------|--------|
-| `many2many:table` | 中间表名 | 按两表名字母序排列组合 |
+| `many2many:table` | 指定中间表名 | 必须在标签中指定，例如 `student_courses` |
 | `foreignKey` | 当前表的主键 | `ID` |
 | `joinForeignKey` | 中间表中指向当前表的外键 | `{当前表名}ID` |
 | `References` | 关联表的主键 | `ID` |
@@ -113,16 +113,24 @@ type Student struct {
 math := Course{Name: "高等数学"}
 english := Course{Name: "大学英语"}
 physics := Course{Name: "大学物理"}
-db.Create(&math)
-db.Create(&english)
-db.Create(&physics)
-
-// 创建学生并选课
-student := Student{
-	Name: "张三",
-	Courses: []Course{math, english},  // 选两门课
+if err := db.Create(&math).Error; err != nil {
+	panic(err)
 }
-db.Select("Courses").Create(&student)
+if err := db.Create(&english).Error; err != nil {
+	panic(err)
+}
+if err := db.Create(&physics).Error; err != nil {
+	panic(err)
+}
+
+// 创建学生并关联已存在的课程
+student := Student{
+	Name:    "张三",
+	Courses: []Course{math, english}, // 选两门课
+}
+if err := db.Select("Courses").Create(&student).Error; err != nil {
+	panic(err)
+}
 // GORM 自动在中间表插入两条记录：
 // INSERT INTO student_courses (student_id, course_id) VALUES (1, 1), (1, 2)
 ```
@@ -173,15 +181,17 @@ for _, s := range course.Students {
 
 ## 24.5 中间表携带额外字段
 
-默认中间表只有两个外键。如果需要额外信息（如选课时间、成绩），需要自定义中间表：
+默认中间表只有两个外键。如果需要额外信息（如选课时间、成绩），需要自定义中间表。`StudentID` 和 `CourseID` 应构成主键或唯一索引，以避免同一学生-课程组合重复：
 
 ```go
+import "time"
+
 // 定义中间表模型
 type StudentCourse struct {
-	StudentID uint    `gorm:"primaryKey"`
-	CourseID  uint    `gorm:"primaryKey"`
-	Score     float64 // 成绩
-	EnrolledAt time.Time  // 选课时间
+	StudentID  uint      `gorm:"primaryKey"`
+	CourseID   uint      `gorm:"primaryKey"`
+	Score      float64   // 成绩
+	EnrolledAt time.Time // 选课时间
 }
 
 type Student struct {
@@ -196,25 +206,34 @@ type Course struct {
 	Students []Student `gorm:"many2many:student_courses"`
 }
 
-// 注册自定义中间表
-db.SetupJoinTable(&Student{}, "Courses", &StudentCourse{})
+// 先注册自定义中间表，再迁移相关模型
+if err := db.SetupJoinTable(&Student{}, "Courses", &StudentCourse{}); err != nil {
+	panic(err)
+}
+if err := db.AutoMigrate(&Student{}, &Course{}, &StudentCourse{}); err != nil {
+	panic(err)
+}
 ```
 
 ### 操作带额外字段的中间表
 
 ```go
-// 添加选课记录（带成绩）
+// 添加选课记录（带成绩）；假定 studentID 和 courseID 已对应有效记录
 studentCourse := StudentCourse{
-	StudentID: 1,
-	CourseID:  1,
-	Score:     92.5,
+	StudentID:  1,
+	CourseID:   1,
+	Score:      92.5,
 	EnrolledAt: time.Now(),
 }
-db.Create(&studentCourse)
+if err := db.Create(&studentCourse).Error; err != nil {
+	panic(err)
+}
 
 // 查询成绩
 var records []StudentCourse
-db.Where("student_id = ?", 1).Find(&records)
+if err := db.Where("student_id = ?", 1).Find(&records).Error; err != nil {
+	panic(err)
+}
 for _, r := range records {
 	fmt.Printf("课程%d: %.1f分\n", r.CourseID, r.Score)
 }
@@ -288,9 +307,8 @@ func main() {
 
 	// 4. 查询每门课的选课人数
 	for _, c := range courses {
-		var count int64
-		db.Model(&c).Association("Students").Count()
-		_ = count
+		count := db.Model(&c).Association("Students").Count()
+		fmt.Printf("%s 有 %d 名学生选修\n", c.Name, count)
 	}
 
 	// 5. 张三退选"大学英语"
@@ -325,18 +343,21 @@ type Course struct {
 }
 ```
 
-### 错误2：Create 时忘记 `Select("Courses")`
+### 错误2：误以为必须用 `Select("Courses")` 才会创建关联
 
 ```go
 student := Student{
 	Name:    "张三",
 	Courses: []Course{{Name: "数学"}, {Name: "英语"}},
 }
-db.Create(&student)
-// ❌ 学生创建了，选课记录没插入！
+// Create 默认会保存非零值关联，并写入中间表
+if err := db.Create(&student).Error; err != nil {
+	panic(err)
+}
 
-// ✅ 加 Select
-db.Select("Courses").Create(&student)
+// 只有在需要明确控制字段或跳过关联时，才使用 Select/Omit
+// db.Select("Name", "Courses").Create(&student)
+// db.Omit("Courses").Create(&student) // 只创建学生，不保存课程关联
 ```
 
 ### 错误3：误以为 Delete 会删除关联对象
@@ -356,7 +377,7 @@ db.Delete(&course)
 
 - Many2Many 通过中间表实现，中间表包含两个外键
 - 标签：`gorm:"many2many:中间表名;joinForeignKey:...;joinReferences:..."`
-- 创建关联用 `db.Select("Courses").Create(&student)`
+- 创建记录时默认会保存非零值关联；用 `Select`/`Omit` 控制是否处理关联
 - 操作关联用 `Association().Append/Delete/Replace/Clear`
 - 中间表有额外字段时，手动定义中间表模型 + `SetupJoinTable`
 - 两边 many2many 的中间表名要一致

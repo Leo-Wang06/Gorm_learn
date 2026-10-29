@@ -153,21 +153,24 @@ db.Create(&user)
 ### 方式三：创建时同时创建关联记录
 
 ```go
-// User 创建时也创建 Company（如果 Company 不存在）
 user := User{
 	Name:    "张三",
 	Company: Company{Name: "新公司"},
 }
 
-// ⚠️ 默认不会自动创建 Company！需要指定
-db.Select("Company").Create(&user)
-// 或
-db.Omit("Company").Create(&user)  // 不处理关联
+// 写法一：Create 默认会保存非零值关联
+if err := db.Create(&user).Error; err != nil {
+	panic(err)
+}
 
-// 同时创建 User 和 Company
-db.Create(&user)  // 只创建 User，不创建 Company（默认行为）
-db.Session(&gorm.Session{FullSaveAssociations: true}).Create(&user)  // 同时创建
+// 写法二：需要显式控制字段时，改用 Select（不要再对同一个 user 重复 Create）
+// err := db.Select("Name", "Company").Create(&user).Error
+
+// Omit 可跳过关联保存；需要自行保证 CompanyID 指向有效记录
+// err := db.Omit("Company").Create(&user).Error
 ```
+
+> `FullSaveAssociations` 主要用来在更新时连同已有关联的全部字段一起保存，不是创建新关联的必要开关。
 
 ---
 
@@ -198,13 +201,14 @@ fmt.Println(user.Company.Name)  // "Google" ✅
 ```go
 var user User
 db.Joins("Company").First(&user, 1)
-// SQL: SELECT `users`.* FROM `users`
+// SQL: SELECT `users`.*, `Company`.`id` AS `Company__id`, ... FROM `users`
 //      LEFT JOIN `companies` AS `Company` ON `users`.`company_id` = `Company`.`id`
 //      WHERE `users`.`id`=1
-// 注意：虽然 JOIN 了 companies 表，但 user.Company 需要单独获取
+// 对于这个 BelongsTo 一对一关联，GORM 会把 JOIN 结果填入 user.Company
+fmt.Println(user.Company.Name)
 ```
 
-> 📌 Preload 和 Joins 的区别：Preload 用两条 SQL 加载，Joins 用一条 SQL 加载。Preload 自动填充关联结构体，Joins 需要通过 Select+Scan 获取。关联查询的详细对比在第25章。
+> 📌 关联名 `Joins` 可将一对一关联结果映射到关联字段；普通 `Joins` SQL 字符串不会自动组装任意关联结构。`Preload` 使用额外查询加载关联，具体差异见第25章。
 
 ---
 
@@ -318,7 +322,7 @@ fmt.Println(user.Company.Name)  // ❌ 空！没有 Preload
 // 因为 GORM 只查了 users 表
 ```
 
-### 错误3：循环 Preload 导致无限加载
+### 错误3：无目的地预加载过深
 
 ```go
 type User struct {
@@ -330,9 +334,14 @@ type Company struct {
 	Users []User  // Company 又引用了 User
 }
 
-// ❌ 危险：如果两边都 Preload 会无限循环
-db.Preload("Company.Users.Company.Users...").Find(&users)
+// ⚠️ 这不会自动无限递归，但会按路径继续查询并产生大量数据
+db.Preload("Company.Users.Company.Users").Find(&users)
+
+// ✅ 只加载当前页面真正需要的层级
+db.Preload("Company").Find(&users)
 ```
+
+> GORM 只会执行你明确写出的预加载路径，不会因为模型双向引用而自动无限加载。
 
 ---
 
