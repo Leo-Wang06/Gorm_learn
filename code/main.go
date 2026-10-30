@@ -17,7 +17,8 @@ import (
 	// "learn/internal/chapter19"
 	// "learn/internal/chapter21"
 	// "learn/internal/chapter22"
-	"learn/internal/chapter23"
+	// "learn/internal/chapter23"
+	"learn/internal/chapter25"
 )
 
 func main() {
@@ -37,6 +38,7 @@ func main() {
 	// chapter19.LearnCode()
 	// chapter21.LearnCode()
 	// chapter22.LearnCode()
-	chapter23.LearnCode()
+	// chapter23.LearnCode()
+	chapter25.LearnCode()
 	
 }

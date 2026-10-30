@@ -11,7 +11,8 @@
 
 ## 前置知识
 - 需要先学习：第09-13章（CRUD）、第27章（事务）
-- 需要了解：Go 的方法和接口
+- 需要了解：Go 的方法、指针接收者和接口
+- 钩子通常运行在当前 GORM 操作的事务上下文中；副作用、批量操作和 `SkipHooks` 的行为需要结合本章限制理解。
 
 ---
 
@@ -130,20 +131,10 @@ func (u *User) AfterCreate(tx *gorm.DB) error {
 
 ```go
 func (u *User) BeforeUpdate(tx *gorm.DB) error {
-	// 自动更新 UpdatedAt（GORM 本身会自动处理，这里只是示例）
-	// u.UpdatedAt = time.Now()  // 实际上 gorm.Model 自动做了
-	return nil
-}
-```
-
-### BeforeUpdate：变更审计
-
-```go
-func (u *User) BeforeUpdate(tx *gorm.DB) error {
-	// 判断哪些字段发生了变化
+	// gorm.Model 的 UpdatedAt 会由 GORM 自动维护，通常不需要手动赋值。
+	// Changed 适合在 Updates(struct/map) 等更新流程中判断待更新字段。
 	if tx.Statement.Changed("Name") {
-		log.Printf("用户 %d 的名字从 %s 改为 %s",
-			u.ID, tx.Statement.Dest, u.Name)
+		log.Printf("用户 %d 的名字将更新为 %s", u.ID, u.Name)
 	}
 	return nil
 }
@@ -163,8 +154,10 @@ func (u *User) BeforeDelete(tx *gorm.DB) error {
 }
 
 func (u *User) AfterDelete(tx *gorm.DB) error {
-	// 删除后清理关联数据
-	tx.Where("user_id = ?", u.ID).Delete(&Order{})
+	// 示例：硬删除后清理关联数据。生产代码要先确认软删除策略、外键约束和级联责任。
+	if err := tx.Where("user_id = ?", u.ID).Delete(&Order{}).Error; err != nil {
+		return err
+	}
 	return nil
 }
 ```
@@ -184,7 +177,7 @@ func (u *User) AfterFind(tx *gorm.DB) error {
 }
 ```
 
-> ⚠️ AfterFind 对性能影响最大：每次 SELECT 都会触发。如果数据量大，谨慎处理。
+> 📌 查询钩子会对实际扫描到的模型记录逐条触发；扫描大量记录时，钩子里的昂贵操作会放大耗时。它不等同于“每条 SELECT 语句只触发一次”，也不适用于所有 `Scan` 到任意 DTO 的查询结果。
 
 ---
 
@@ -208,7 +201,10 @@ package main
 import (
 	"fmt"
 	"log"
+	"strings"
 	"time"
+
+	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
@@ -217,16 +213,16 @@ type User struct {
 	ID        uint      `gorm:"primaryKey"`
 	UUID      string    `gorm:"type:varchar(36);uniqueIndex"`
 	Username  string    `gorm:"type:varchar(50);uniqueIndex;not null"`
-	Password  string    `gorm:"type:varchar(255);not null;->:false"` // 不可读
+	Password  string    `gorm:"type:varchar(255);not null"` // 不要把密码字段直接序列化到响应；数据库中只保存哈希
 	Email     string    `gorm:"type:varchar(255)"`
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
 
 func (u *User) BeforeCreate(tx *gorm.DB) error {
-	// 1. 生成 UUID
+	// 1. 生成真正的随机 UUID；不要用时间戳拼接伪造 UUID。
 	if u.UUID == "" {
-		u.UUID = fmt.Sprintf("%d-%d", time.Now().UnixNano(), u.ID)
+		u.UUID = uuid.NewString()
 	}
 
 	// 2. 密码加密
@@ -238,27 +234,21 @@ func (u *User) BeforeCreate(tx *gorm.DB) error {
 		u.Password = string(hashed)
 	}
 
-	// 3. 邮箱默认值
 	if u.Email == "" {
 		u.Email = u.Username + "@example.com"
 	}
-
 	return nil
 }
 
-func (u *User) BeforeUpdate(tx *gorm.DB) error {
-	// 如果密码被修改了，重新加密
-	if tx.Statement.Changed("Password") && u.Password != "" {
-		// 判断是否已经是加密过的（bcrypt 密文长度是 60）
-		if len(u.Password) != 60 {
-			hashed, err := bcrypt.GenerateFromPassword([]byte(u.Password), bcrypt.DefaultCost)
-			if err != nil {
-				return err
-			}
-			u.Password = string(hashed)
-		}
+// 不建议在通用 BeforeUpdate 中猜测 Password 当前是明文还是 bcrypt 哈希。
+// 由专门的业务方法先哈希，再明确更新字段，避免重复哈希或误存明文。
+func UpdatePassword(db *gorm.DB, userID uint, plainPassword string) error {
+	hashed, err := bcrypt.GenerateFromPassword([]byte(plainPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return err
 	}
-	return nil
+	return db.Model(&User{}).Where("id = ?", userID).
+		Update("Password", string(hashed)).Error
 }
 
 func (u *User) BeforeDelete(tx *gorm.DB) error {

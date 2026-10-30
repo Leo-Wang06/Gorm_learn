@@ -11,7 +11,8 @@
 
 ## 前置知识
 - 需要先学习：第12-13章（Update、Delete）
-- 需要了解：MySQL 事务基础（BEGIN/COMMIT/ROLLBACK）
+- 需要了解：MySQL 事务基础（BEGIN/COMMIT/ROLLBACK）和 Go 错误处理
+- 锁、隔离级别和并发行为依赖数据库与存储引擎；本文以支持事务的 MySQL/InnoDB 为例，具体以目标数据库文档和实测为准。
 
 ---
 
@@ -78,59 +79,80 @@ if err != nil {
 当你需要更灵活的控制时：
 
 ```go
-// 开启事务
+// 开启事务，并立即检查 Begin 错误
 tx := db.Begin()
+if tx.Error != nil {
+	return tx.Error
+}
 
-// 操作1
+// 任何提前返回都回滚；提交成功后 Rollback 不会撤销已提交事务。
+defer tx.Rollback()
+
 if err := tx.Model(&Account{}).Where("id = ?", 1).
 	Update("balance", gorm.Expr("balance - ?", 100)).Error; err != nil {
-	tx.Rollback()
 	return err
 }
-
-// 操作2
 if err := tx.Model(&Account{}).Where("id = ?", 2).
 	Update("balance", gorm.Expr("balance + ?", 100)).Error; err != nil {
-	tx.Rollback()
 	return err
 }
 
-// 提交事务
-tx.Commit()
+// 必须检查 Commit 错误
+if err := tx.Commit().Error; err != nil {
+	return err
+}
+return nil
 ```
 
-> ⚠️ 手动事务必须记得 Rollback。推荐用 `db.Transaction()`（自动处理）。
+> ⚠️ 推荐 `db.Transaction()` 处理常规事务。手动事务要检查 `Begin`、各操作和 `Commit` 的错误，并确保所有提前退出路径都会回滚。
 
 ---
 
 ## 27.4 嵌套事务与 SavePoint
 
+下面假设已定义 `AuditRecord` 模型。GORM 的嵌套 `Transaction` 通常使用 SavePoint 模拟；这不是所有数据库上都能嵌套开启真正独立的物理事务。
+
 ```go
-db.Transaction(func(tx *gorm.DB) error {
-	// 外层事务
-
-	tx.Transaction(func(tx2 *gorm.DB) error {
-		// 内层事务：创建一个 SavePoint
-		// 如果失败，只回滚到 SavePoint，不影响外层
-		return nil
-	})
-
+err := db.Transaction(func(tx *gorm.DB) error {
+	// 内层 GORM Transaction 通常通过 SavePoint 实现嵌套事务（取决于方言支持）。
+	if err := tx.Transaction(func(tx2 *gorm.DB) error {
+		// 内层操作失败会回滚到保存点；若错误继续返回，外层也会回滚。
+		return tx2.Create(&AuditRecord{Message: "inner operation"}).Error
+	}); err != nil {
+		// 若业务允许内层失败但外层继续，应在这里明确处理该错误。
+		return err
+	}
 	return nil
 })
+if err != nil {
+	return err
+}
 ```
 
 手动使用 SavePoint：
 ```go
 tx := db.Begin()
+if tx.Error != nil {
+	return tx.Error
+}
+defer tx.Rollback()
 
-tx.SavePoint("sp1")  // 设置保存点
+if err := tx.SavePoint("sp1").Error; err != nil {
+	return err
+}
 
 // ... 一些操作 ...
 
-tx.RollbackTo("sp1")  // 回滚到保存点（只撤销 sp1 之后的操作）
-
-tx.Commit()
+if err := tx.RollbackTo("sp1").Error; err != nil {
+	return err
+}
+if err := tx.Commit().Error; err != nil {
+	return err
+}
+return nil
 ```
+
+> 📌 SavePoint 不是独立事务；回滚到保存点后，外层事务仍然存在，最终仍需 Commit 或 Rollback。驱动和数据库对 SavePoint 的支持也可能不同。
 
 ---
 
@@ -139,25 +161,30 @@ tx.Commit()
 ```go
 import "database/sql"
 
-// 设置隔离级别
+// 通过 database/sql 的 TxOptions 请求隔离级别；不再同时执行 SET TRANSACTION，
+// 避免重复设置及数据库方言/事务时序差异。
 err := db.Transaction(func(tx *gorm.DB) error {
-	tx.Exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
 	// ... 事务操作 ...
 	return nil
 }, &sql.TxOptions{
-	Isolation: sql.LevelRepeatableRead,  // 设置隔离级别
+	Isolation: sql.LevelRepeatableRead,
 	ReadOnly:  false,
 })
+if err != nil {
+	return err
+}
 ```
+
+> 📌 驱动/数据库可能不支持或不完全实现请求的隔离级别，务必处理返回错误，并确认数据库默认值和实际事务行为。
 
 四种隔离级别：
 
 | 级别 | 解决 | 不解决 | Go 常量 |
 |------|------|--------|---------|
-| READ UNCOMMITTED | — | 脏读、不可重复读、幻读 | `LevelReadUncommitted` |
-| READ COMMITTED | 脏读 | 不可重复读、幻读 | `LevelReadCommitted` |
-| REPEATABLE READ（MySQL默认） | 脏读、不可重复读 | 幻读（部分） | `LevelRepeatableRead` |
-| SERIALIZABLE | 全部 | — | `LevelSerializable` |
+| READ UNCOMMITTED | 通常可读未提交数据 | 具体并发异常依实现而定 | `LevelReadUncommitted` |
+| READ COMMITTED | 防止脏读 | 同一事务重复读取可能看到已提交的新值；范围查询可能出现新行 | `LevelReadCommitted` |
+| REPEATABLE READ | 防止脏读、普通一致性读通常可重复 | 范围锁定读/写入行为需结合数据库实现；InnoDB 使用间隙/Next-Key 锁等机制处理部分幻读场景 | `LevelRepeatableRead` |
+| SERIALIZABLE | 提供更强隔离 | 并发能力可能下降，锁等待/死锁风险增加 | `LevelSerializable` |
 
 ---
 
@@ -166,25 +193,32 @@ err := db.Transaction(func(tx *gorm.DB) error {
 ### 悲观锁（SELECT ... FOR UPDATE）
 
 ```go
-db.Transaction(func(tx *gorm.DB) error {
+err := db.Transaction(func(tx *gorm.DB) error {
 	var product Product
 
-	// 锁定这行数据，其他事务不能修改
-	tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+	// 行锁只在支持该语法的数据库事务中有效，并通常持有到事务结束。
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where("id = ?", 1).
-		First(&product)
-	// SQL: SELECT * FROM `products` WHERE id=1 FOR UPDATE
+		First(&product).Error; err != nil {
+		return err
+	}
 
-	// 检查库存
 	if product.Stock < 10 {
 		return fmt.Errorf("库存不足")
 	}
 
-	// 扣库存
-	tx.Model(&product).Update("stock", gorm.Expr("stock - ?", 10))
-
+	result := tx.Model(&product).Update("stock", gorm.Expr("stock - ?", 10))
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return fmt.Errorf("库存记录未更新")
+	}
 	return nil
 })
+if err != nil {
+	return err
+}
 ```
 
 ### 乐观锁（版本号）
@@ -199,15 +233,17 @@ type Product struct {
 
 // 扣库存（乐观锁）
 result := db.Model(&Product{}).
-	Where("id = ? AND version = ?", id, currentVersion).
+	Where("id = ? AND version = ? AND stock >= ?", id, currentVersion, quantity).
 	Updates(map[string]interface{}{
 		"stock":   gorm.Expr("stock - ?", quantity),
 		"version": gorm.Expr("version + 1"),
 	})
-
+if result.Error != nil {
+	return result.Error
+}
 if result.RowsAffected == 0 {
-	// 没有行被更新 → 版本号变了 → 并发冲突，重试
-	return fmt.Errorf("并发冲突，请重试")
+	// 可能是记录不存在、库存不足或版本冲突；必要时重新读取区分原因。
+	return fmt.Errorf("更新未生效：记录不存在、库存不足或并发冲突")
 }
 ```
 
@@ -220,8 +256,11 @@ package main
 
 import (
 	"fmt"
+	"sort"
+
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 )
 
@@ -232,45 +271,52 @@ type Account struct {
 }
 
 func Transfer(db *gorm.DB, fromID, toID uint, amount float64) error {
+	if fromID == toID {
+		return fmt.Errorf("转出和转入账户不能相同")
+	}
+	if amount <= 0 {
+		return fmt.Errorf("转账金额必须大于 0")
+	}
+
 	return db.Transaction(func(tx *gorm.DB) error {
-		// 1. 查询转出账户（悲观锁）
-		var from Account
-		if err := tx.Clauses(gorm.Clauses{clause.Locking{Strength: "UPDATE"}}).
-			First(&from, fromID).Error; err != nil {
-			return fmt.Errorf("转出账户不存在: %w", err)
+		// 按 ID 升序锁定两行，降低并发反向转账时的死锁概率。
+		ids := []uint{fromID, toID}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		var locked []Account
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id IN ?", ids).Order("id ASC").Find(&locked).Error; err != nil {
+			return err
+		}
+		if len(locked) != 2 {
+			return fmt.Errorf("转出或转入账户不存在")
 		}
 
-		// 2. 检查余额
+		accounts := make(map[uint]Account, len(locked))
+		for _, account := range locked {
+			accounts[account.ID] = account
+		}
+		from, fromOK := accounts[fromID]
+		to, toOK := accounts[toID]
+		if !fromOK || !toOK {
+			return fmt.Errorf("转出或转入账户不存在")
+		}
 		if from.Balance < amount {
 			return fmt.Errorf("余额不足：当前 %.2f，需要 %.2f", from.Balance, amount)
 		}
 
-		// 3. 查询转入账户
-		var to Account
-		if err := tx.First(&to, toID).Error; err != nil {
-			return fmt.Errorf("转入账户不存在: %w", err)
+		if err := tx.Model(&Account{}).Where("id = ?", fromID).
+			Update("balance", gorm.Expr("balance - ?", amount)).Error; err != nil {
+			return err
 		}
-
-		// 4. 扣款
-		if err := tx.Model(&from).Update("balance", gorm.Expr("balance - ?", amount)).Error; err != nil {
+		if err := tx.Model(&Account{}).Where("id = ?", toID).
+			Update("balance", gorm.Expr("balance + ?", amount)).Error; err != nil {
 			return err
 		}
 
-		// 5. 加款
-		if err := tx.Model(&to).Update("balance", gorm.Expr("balance + ?", amount)).Error; err != nil {
+		transferLog := TransferLog{FromID: fromID, ToID: toID, Amount: amount}
+		if err := tx.Create(&transferLog).Error; err != nil {
 			return err
 		}
-
-		// 6. 记录转账日志
-		log := TransferLog{
-			FromID: fromID,
-			ToID:   toID,
-			Amount: amount,
-		}
-		if err := tx.Create(&log).Error; err != nil {
-			return err
-		}
-
 		return nil
 	})
 }
@@ -284,27 +330,42 @@ type TransferLog struct {
 
 func main() {
 	dsn := "root:123456@tcp(127.0.0.1:3306)/gorm_tutorial?charset=utf8mb4&parseTime=True&loc=Local"
-	db, _ := gorm.Open(mysql.Open(dsn), &gorm.Config{
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Info),
 	})
-
-	db.AutoMigrate(&Account{}, &TransferLog{})
-
-	// 创建测试账户
-	db.Create(&Account{Name: "张三", Balance: 1000})
-	db.Create(&Account{Name: "李四", Balance: 500})
-
-	// 执行转账
-	err := Transfer(db, 1, 2, 200)
 	if err != nil {
-		fmt.Println("转账失败:", err)
-	} else {
-		fmt.Println("转账成功！")
-		var a1, a2 Account
-		db.First(&a1, 1)
-		db.First(&a2, 2)
-		fmt.Printf("张三: %.2f, 李四: %.2f\n", a1.Balance, a2.Balance)
+		panic(err)
 	}
+	if err := db.AutoMigrate(&Account{}, &TransferLog{}); err != nil {
+		panic(err)
+	}
+
+	// 仅限专用练习数据库：下面会删除这两张表的全部记录，不要对真实或共享数据库运行。
+	if err := db.Exec("DELETE FROM transfer_logs").Error; err != nil {
+		panic(err)
+	}
+	if err := db.Exec("DELETE FROM accounts").Error; err != nil {
+		panic(err)
+	}
+	if err := db.Create(&Account{ID: 1, Name: "张三", Balance: 1000}).Error; err != nil {
+		panic(err)
+	}
+	if err := db.Create(&Account{ID: 2, Name: "李四", Balance: 500}).Error; err != nil {
+		panic(err)
+	}
+
+	if err := Transfer(db, 1, 2, 200); err != nil {
+		fmt.Println("转账失败:", err)
+		return
+	}
+	var a1, a2 Account
+	if err := db.First(&a1, 1).Error; err != nil {
+		panic(err)
+	}
+	if err := db.First(&a2, 2).Error; err != nil {
+		panic(err)
+	}
+	fmt.Printf("转账成功！张三: %.2f, 李四: %.2f\n", a1.Balance, a2.Balance)
 }
 ```
 
@@ -328,14 +389,15 @@ db.Transaction(func(tx *gorm.DB) error {
 })
 ```
 
-### 错误2：事务闭包中 panic 被吞掉
+### 错误2：误以为事务会吞掉 panic
 
 ```go
-db.Transaction(func(tx *gorm.DB) error {
-	panic("oops")  // GORM 会 recover，自动 ROLLBACK
-	// 但你需要知道出了什么事
+err := db.Transaction(func(tx *gorm.DB) error {
+	panic("oops")
 })
 ```
+
+GORM 会尝试回滚后重新抛出 panic；它不会把 panic 转换为普通 `error`。如果应用需要恢复，应在合适的上层边界使用 `recover`，不要在事务回调里假装 panic 已被处理。
 
 ### 错误3：手动事务忘记 Rollback
 
@@ -345,13 +407,18 @@ tx := db.Begin()
 // 直接 return 了，忘记 tx.Rollback()
 // 连接被占用！事务一直开着！
 
-// ✅ 用 defer + recover
+// ✅ 手动事务可用 deferred Rollback 兜底，并检查 Begin/Commit
+// 常规流程更推荐 db.Transaction(...)。
 tx := db.Begin()
-defer func() {
-	if r := recover(); r != nil {
-		tx.Rollback()
-	}
-}()
+if tx.Error != nil {
+	return tx.Error
+}
+defer tx.Rollback()
+
+// ...执行操作；任何错误直接 return，defer 会回滚...
+if err := tx.Commit().Error; err != nil {
+	return err
+}
 ```
 
 ---

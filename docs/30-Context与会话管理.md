@@ -9,7 +9,8 @@
 
 ## 前置知识
 - 需要先学习：第04章（配置与Logger）
-- 需要了解：Go 的 `context` 包基础
+- 需要了解：Go 的 `context` 包基础、HTTP Handler 和 GORM 链式查询
+- `WithContext` 只能传递取消/截止时间等信号；数据库驱动及服务器是否及时响应取消，还取决于其实现。
 
 ---
 
@@ -38,10 +39,17 @@ if err != nil {
 
 ```go
 func HandleGetUsers(w http.ResponseWriter, r *http.Request) {
-	// r.Context() 包含请求超时、取消、trace 信息
+	// r.Context() 会在请求结束/客户端断开时取消；trace 等值由上游约定注入。
 	var users []User
-	err := db.WithContext(r.Context()).Find(&users).Error
-	// 如果 HTTP 客户端断开连接，查询自动取消
+	if err := db.WithContext(r.Context()).Find(&users).Error; err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			http.Error(w, "request canceled", http.StatusRequestTimeout)
+			return
+		}
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
+	// 写回响应...
 }
 ```
 
@@ -49,20 +57,20 @@ func HandleGetUsers(w http.ResponseWriter, r *http.Request) {
 
 ## 30.2 `db.Session()`：会话配置
 
-Session 是 GORM v2 的核心创新——在特定操作上覆盖全局配置：
+Session 用于在特定操作链上覆盖配置或创建新的查询状态；它不会创建新的数据库连接池：
 
 ```go
 sessionDB := db.Session(&gorm.Session{
-	NewDB:                true,   // 创建一个独立的 *gorm.DB
-	SkipDefaultTransaction: true, // 跳过默认事务
-	PrepareStmt:          true,   // 预编译缓存
-	DryRun:               false,  // 不真正执行 SQL
-	SkipHooks:            false,  // 跳过钩子
-	AllowGlobalUpdate:    false,  // 允许全表更新
-	FullSaveAssociations: false,  // 全量保存关联
-	QueryFields:          false,  // 查询时使用字段名
-	Logger:               customLogger, // 覆盖 Logger
-	Context:              ctx,    // 设置 Context
+	NewDB:                 true,          // 新建不带既有条件的查询状态；保留底层连接池
+	SkipDefaultTransaction: true,         // 写操作跳过 GORM 默认事务（需理解一致性风险）
+	PrepareStmt:           true,          // 启用预编译语句缓存
+	DryRun:                false,         // true 才只构造 SQL、不执行
+	SkipHooks:             false,         // true 才跳过钩子
+	AllowGlobalUpdate:     false,         // true 才允许无条件批量更新/删除
+	FullSaveAssociations:  false,         // true 才完整保存关联字段
+	QueryFields:           false,         // true 才按字段名显式选择列
+	Logger:                customLogger,  // 覆盖当前会话 Logger
+	Context:               ctx,           // 设置当前会话的 Context
 })
 ```
 
@@ -73,9 +81,10 @@ sessionDB := db.Session(&gorm.Session{
 db.Session(&gorm.Session{Logger: logger.Default.LogMode(logger.Info)}).
 	Where("age > ?", 18).Find(&users)
 
-// 场景2：预览 SQL 但不执行
-db.Session(&gorm.Session{DryRun: true}).
-	Create(&User{Name: "测试"})
+// 场景2：预览 SQL 但不执行；使用 Statement 查看生成的 SQL 和绑定变量
+stmt := db.Session(&gorm.Session{DryRun: true}).
+	Create(&User{Name: "测试"}).Statement
+fmt.Println(stmt.SQL.String(), stmt.Vars)
 
 // 场景3：全表更新（慎用）
 db.Session(&gorm.Session{AllowGlobalUpdate: true}).
@@ -92,8 +101,8 @@ db.Debug().Where("age > ?", 18).Find(&users)
 // 日志会输出：
 // [1.234ms] [rows:3] SELECT * FROM `users` WHERE age > 18
 
-// Debug 本质上是 Session 的快捷方式
-db.Debug() == db.Session(&gorm.Session{Logger: ...})
+// Debug 本质上是临时提高当前链的日志级别；不要用指针相等判断两个 *gorm.DB。
+// 可理解为：db.Debug() 等价于为这条查询链使用 Info 级别 Logger。
 ```
 
 ---
@@ -101,19 +110,18 @@ db.Debug() == db.Session(&gorm.Session{Logger: ...})
 ## 30.4 Session 的线程安全性
 
 ```go
-// ✅ *gorm.DB 是并发安全的，可以在多个 goroutine 中共用
-var db *gorm.DB
-
+// 已初始化的根 *gorm.DB 可由多个 goroutine 共用；每个请求使用自己的目标变量和 Context。
 func handler(w http.ResponseWriter, r *http.Request) {
-	db.WithContext(r.Context()).Find(&users)  // 安全
+	var users []User
+	if err := db.WithContext(r.Context()).Find(&users).Error; err != nil {
+		http.Error(w, "database error", http.StatusInternalServerError)
+		return
+	}
 }
 
-// ⚠️ 但 Session 修改的是副本
-func handler(w http.ResponseWriter, r *http.Request) {
-	// Session 返回新的 *gorm.DB，不影响原始的 db
-	sessionDB := db.Session(&gorm.Session{})
-	sessionDB.Where(...)  // 不影响其他 goroutine 中的 db
-}
+// Session 产生新的会话配置/查询状态；链式方法返回新 DB 状态，避免并发请求共享可变的查询链。
+sessionDB := db.Session(&gorm.Session{DryRun: true})
+_ = sessionDB
 ```
 
 ---
@@ -121,9 +129,9 @@ func handler(w http.ResponseWriter, r *http.Request) {
 ## 本章小结
 
 - `db.WithContext(ctx)` 传递超时、取消信号
-- `db.Session(config)` 创建独立配置的会话
-- `db.Debug()` 是调试 SQL 的快速手段
-- `*gorm.DB` 并发安全，Session 操作副本
+- `db.Session(config)` 为查询链设置独立配置/状态，但不创建新的连接池
+- `db.Debug()` 是临时提高日志级别的调试手段
+- 已初始化的根 `*gorm.DB` 可并发复用；不要跨请求共享并修改同一条查询链
 - HTTP 请求中始终使用 `r.Context()`
 
 ## 练习题
