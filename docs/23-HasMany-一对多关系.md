@@ -16,7 +16,7 @@
 
 ## 23.1 HasMany：有一个对多个
 
-HasMany 表示"A 有多个 B"，外键在 B 表中。与 HasOne 一样，外键列位于子表；数据库是否允许多个子记录指向同一父记录，取决于该列上的约束（HasMany 通常不设 UNIQUE）：
+HasMany 表示"A 拥有多个 B"，外键在 B 表中（和 HasOne 一样，但没有 UNIQUE 约束）：
 
 ```
 ┌──────────┐         ┌──────────┐
@@ -104,7 +104,7 @@ db.Create(&order2)
 ### 方式二：通过关联对象创建
 
 ```go
-// 创建用户时同时创建非零值关联订单（Create 默认会保存关联）
+// 创建用户时同时创建订单
 user := User{
 	Name: "张三",
 	Orders: []Order{
@@ -113,15 +113,12 @@ user := User{
 		{Amount: 300},
 	},
 }
-if err := db.Create(&user).Error; err != nil {
-	panic(err)
-}
-// 需要显式控制参与创建的字段时，可用 db.Select("Name", "Orders").Create(&user)
+db.Select("Orders").Create(&user)  // 同时创建 User 和 Orders
 
-// 给已有用户追加订单：Association 的完整语义见第26章
-var existingUser User
-db.First(&existingUser, 1)
-db.Model(&existingUser).Association("Orders").Append(
+// 给已有用户追加订单
+var user User
+db.First(&user, 1)
+db.Model(&user).Association("Orders").Append(
 	&Order{Amount: 400},
 	&Order{Amount: 500},
 )
@@ -157,13 +154,16 @@ db.Preload("Orders", func(db *gorm.DB) *gorm.DB {
 }).Find(&users)
 // 注意：此 Limit(5) 限制本次关联查询返回的总订单数，不是每个用户各取 5 条。
 // 若要对每个用户分别取前 5 条，需使用按分组排名的 SQL 等方案。
+```
 
-### 用 JOIN 查询有订单的用户
+### 用 Joins 查询有订单的用户
 
 ```go
-// 用显式 JOIN 过滤有订单的用户，并对主表列去重
+// 查有订单的用户（用 DISTINCT 去重）
 var users []User
-db.Joins("JOIN orders ON orders.user_id = users.id").Distinct().Find(&users)
+db.Joins("Orders").Distinct().Find(&users)
+// 等价于：SELECT DISTINCT users.* FROM users
+//         JOIN orders ON users.id = orders.user_id
 ```
 
 > HasMany 是集合关联。关联名 `Joins("Orders")` 不应当当作 `Preload` 的替代品来组装 `Orders` 切片；需要关联集合时用 `Preload("Orders")`。

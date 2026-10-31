@@ -113,24 +113,16 @@ type Student struct {
 math := Course{Name: "高等数学"}
 english := Course{Name: "大学英语"}
 physics := Course{Name: "大学物理"}
-if err := db.Create(&math).Error; err != nil {
-	panic(err)
-}
-if err := db.Create(&english).Error; err != nil {
-	panic(err)
-}
-if err := db.Create(&physics).Error; err != nil {
-	panic(err)
-}
+db.Create(&math)
+db.Create(&english)
+db.Create(&physics)
 
-// 创建学生并关联已存在的课程
+// 创建学生并选课
 student := Student{
-	Name:    "张三",
-	Courses: []Course{math, english}, // 选两门课
+	Name: "张三",
+	Courses: []Course{math, english},  // 选两门课
 }
-if err := db.Select("Courses").Create(&student).Error; err != nil {
-	panic(err)
-}
+db.Select("Courses").Create(&student)
 // GORM 自动在中间表插入两条记录：
 // INSERT INTO student_courses (student_id, course_id) VALUES (1, 1), (1, 2)
 ```
@@ -181,17 +173,15 @@ for _, s := range course.Students {
 
 ## 24.5 中间表携带额外字段
 
-默认中间表只有两个外键。如果需要额外信息（如选课时间、成绩），需要自定义中间表。`StudentID` 和 `CourseID` 应构成主键或唯一索引，以避免同一学生-课程组合重复：
+默认中间表只有两个外键。如果需要额外信息（如选课时间、成绩），需要自定义中间表：
 
 ```go
-import "time"
-
 // 定义中间表模型
 type StudentCourse struct {
-	StudentID  uint      `gorm:"primaryKey"`
-	CourseID   uint      `gorm:"primaryKey"`
-	Score      float64   // 成绩
-	EnrolledAt time.Time // 选课时间
+	StudentID uint    `gorm:"primaryKey"`
+	CourseID  uint    `gorm:"primaryKey"`
+	Score     float64 // 成绩
+	EnrolledAt time.Time  // 选课时间
 }
 
 type Student struct {
@@ -206,13 +196,8 @@ type Course struct {
 	Students []Student `gorm:"many2many:student_courses"`
 }
 
-// 先注册自定义中间表，再迁移相关模型
-if err := db.SetupJoinTable(&Student{}, "Courses", &StudentCourse{}); err != nil {
-	panic(err)
-}
-if err := db.AutoMigrate(&Student{}, &Course{}, &StudentCourse{}); err != nil {
-	panic(err)
-}
+// 注册自定义中间表
+db.SetupJoinTable(&Student{}, "Courses", &StudentCourse{})
 ```
 
 ### 操作带额外字段的中间表

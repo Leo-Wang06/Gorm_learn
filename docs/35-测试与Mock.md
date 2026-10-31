@@ -16,20 +16,42 @@
 
 ## 35.1 使用 SQLite 内存数据库测试
 
+先安装本章示例用到的驱动和 Mock 库：
+
+```bash
+go get gorm.io/driver/sqlite
+go get github.com/DATA-DOG/go-sqlmock
+```
+
 ```go
 import (
+	"fmt"
 	"testing"
+
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
 func setupTestDB(t *testing.T) *gorm.DB {
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	t.Helper()
+	// shared cache + 保持连接，避免 SQLite 每个连接各自拥有独立的 :memory: 数据库。
+	db, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("无法创建测试数据库: %v", err)
 	}
-	// 自动建表
-	db.AutoMigrate(&User{})
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("无法获取底层数据库连接: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+
+	// 自动建表；测试代码应检查迁移错误
+	if err := db.AutoMigrate(&User{}); err != nil {
+		t.Fatalf("自动迁移失败: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = sqlDB.Close()
+	})
 	return db
 }
 ```
@@ -43,25 +65,24 @@ func TestCreateUser(t *testing.T) {
 	db := setupTestDB(t)
 
 	user := User{Name: "张三", Age: 25}
-	result := db.Create(&user)
-
-	if result.Error != nil {
-		t.Errorf("创建用户失败: %v", result.Error)
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatalf("创建用户失败: %v", err)
 	}
-	if user.ID != 1 {
-		t.Errorf("期望 ID=1, 得到 ID=%d", user.ID)
+	if user.ID == 0 {
+		t.Fatalf("期望数据库回填非零主键")
 	}
 }
 
 func TestFindUser(t *testing.T) {
 	db := setupTestDB(t)
-	db.Create(&User{Name: "张三", Age: 25})
+	created := User{Name: "张三", Age: 25}
+	if err := db.Create(&created).Error; err != nil {
+		t.Fatalf("准备测试数据失败: %v", err)
+	}
 
 	var user User
-	result := db.First(&user, 1)
-
-	if result.Error != nil {
-		t.Errorf("查询用户失败: %v", result.Error)
+	if err := db.First(&user, created.ID).Error; err != nil {
+		t.Fatalf("查询用户失败: %v", err)
 	}
 	if user.Name != "张三" {
 		t.Errorf("期望 Name='张三', 得到 '%s'", user.Name)
@@ -77,18 +98,25 @@ func TestFindUser(t *testing.T) {
 func TestWithTransactionRollback(t *testing.T) {
 	db := setupTestDB(t)
 
-	// 在事务中执行测试
+	// 在事务中执行测试；使用同一个事务句柄完成所有断言
 	tx := db.Begin()
-	defer tx.Rollback()  // 测试结束自动回滚，不留垃圾数据
+	if tx.Error != nil {
+		t.Fatalf("开启事务失败: %v", tx.Error)
+	}
+	defer tx.Rollback() // 测试结束自动回滚
 
-	// 测试操作...
-	tx.Create(&User{Name: "测试用户"})
+	if err := tx.Create(&User{Name: "测试用户"}).Error; err != nil {
+		t.Fatalf("创建测试数据失败: %v", err)
+	}
 	var count int64
-	tx.Model(&User{}).Count(&count)
+	if err := tx.Model(&User{}).Count(&count).Error; err != nil {
+		t.Fatalf("统计测试数据失败: %v", err)
+	}
 	if count != 1 {
 		t.Errorf("期望 1 个用户, 得到 %d", count)
 	}
-	// 事务回滚后数据库中不会有"测试用户"
+	// 事务回滚后数据库中不会有"测试用户"。
+	// 此模式适用于测试代码能在同一事务连接中运行的场景；不适合并行测试共享同一事务。
 }
 ```
 
@@ -104,22 +132,33 @@ import (
 
 func TestWithSqlmock(t *testing.T) {
 	// 创建 mock 数据库连接
-	sqlDB, mock, _ := sqlmock.New()
+	sqlDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("创建 sqlmock 失败: %v", err)
+	}
 	defer sqlDB.Close()
 
-	db, _ := gorm.Open(mysql.New(mysql.Config{
+	db, err := gorm.Open(mysql.New(mysql.Config{
 		Conn:                      sqlDB,
 		SkipInitializeWithVersion: true,
 	}), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("初始化 GORM 失败: %v", err)
+	}
 
-	// 设置期望的 SQL
-	mock.ExpectQuery("SELECT .* FROM `users`").
+	// GORM 的 First 会生成带主键排序和 LIMIT 的 SQL；Regexp 字符串中的反斜杠需转义。
+	mock.ExpectQuery("SELECT .* FROM `users`.*ORDER BY `users`\\.`id` LIMIT 1").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "age"}).
 			AddRow(1, "张三", 25))
 
 	// 执行查询
 	var user User
-	db.First(&user)
+	if err := db.First(&user).Error; err != nil {
+		t.Fatalf("查询用户失败: %v", err)
+	}
+	if user.Name != "张三" {
+		t.Fatalf("期望 Name=张三，得到 %q", user.Name)
+	}
 
 	// 验证期望
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -134,9 +173,12 @@ func TestWithSqlmock(t *testing.T) {
 
 ```go
 // 创建测试数据
-func createTestUser(db *gorm.DB) *User {
+func createTestUser(t *testing.T, db *gorm.DB) *User {
+	t.Helper()
 	user := &User{Name: "测试用户", Age: 25}
-	db.Create(user)
+	if err := db.Create(user).Error; err != nil {
+		t.Fatalf("创建测试用户失败: %v", err)
+	}
 	return user
 }
 
@@ -173,7 +215,8 @@ func TestFindUserByAge(t *testing.T) {
 
 ## 本章小结
 
-- SQLite `:memory:` 是测试首选（快速、隔离、无需真实 MySQL）
+- SQLite 内存数据库适合快速单元测试；使用共享内存 DSN/单连接池避免连接间看不到表
+- SQLite 与 MySQL 的类型、SQL 方言、约束和事务行为仍有差异，关键集成测试要使用真实 MySQL
 - 事务回滚避免测试间数据污染
 - 表驱动测试覆盖多种场景
 - sqlmock 用于不依赖真实数据库的单元测试

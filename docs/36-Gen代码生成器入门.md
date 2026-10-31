@@ -21,8 +21,9 @@ Gen 是 GORM 官方出品的代码生成器，解决手写代码的三个痛点�
 // 手写 GORM（字符串字段名，拼错了编译不报错）
 db.Where("nmae = ?", "张三")  // "name" 拼成 "nmae" 编译通过，运行时才发现
 
-// Gen 生成的代码（类型安全，拼错编译就报错）
-u := query.User
+// Gen 生成的代码（类型安全，字段名拼错通常会在编译期暴露）
+// 使用已初始化的 q := query.Use(db)
+u := q.User
 u.Where(u.Name.Eq("张三"))
 ```
 
@@ -37,8 +38,11 @@ u.Where(u.Name.Eq("张三"))
 
 ## 36.2 安装和配置
 
+在项目目录中安装 Gen 运行时代码和 MySQL 驱动：
+
 ```bash
-go get -u gorm.io/gen
+go get gorm.io/gen
+go get gorm.io/driver/mysql
 ```
 
 ### 基本配置
@@ -54,26 +58,35 @@ import (
 
 func main() {
 	// 1. 连接数据库
-	db, _ := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	if err != nil {
+		panic(err)
+	}
 
-	// 2. 创建生成器
+	// 2. 创建生成器。OutPath 是 Query 输出目录；ModelPkgPath 是生成模型的 Go 包路径。
+	// 如果使用 GenerateModel 从数据库生成模型，生成器必须连接到已有表；不会自动替你建表。
+	// 下面的 dsn、表结构和 module/import 路径请替换为自己的项目配置。
 	g := gen.NewGenerator(gen.Config{
-		OutPath:      "./query",     // 生成代码输出目录
-		ModelPkgPath: "./model",     // 模型代码输出目录
-		Mode:         gen.WithDefaultQuery, // 启用默认查询
+		OutPath:         "./query",
+		ModelPkgPath:    "./model",
+		Mode:            gen.WithDefaultQuery,
+		FieldNullable:     true, // 数据库可 NULL 的字段生成指针等可空类型
+		FieldWithIndexTag: true, // 将数据库索引信息写入生成模型标签
 	})
 
 	// 3. 设置数据库连接
 	g.UseDB(db)
 
-	// 4. 生成模型
+	// 4. 生成模型。GenerateModel 会读取数据库表结构，因此必须先 UseDB。
 	g.ApplyBasic(
 		g.GenerateModel("users"),
 		g.GenerateModel("orders"),
 	)
 
-	// 5. 执行生成
-	g.Execute()
+	// 5. 执行生成，并检查错误
+	if err := g.Execute(); err != nil {
+		panic(err)
+	}
 }
 ```
 
@@ -92,29 +105,51 @@ go run main.go
 
 ```go
 import (
-	"your-project/query"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
+
 	"your-project/model"
+	"your-project/query"
 )
 
 func main() {
-	db, _ := gorm.Open(mysql.Open(dsn), &gorm.Config{})
-	q := query.Use(db)  // 使用生成的 Query
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	if err != nil {
+		panic(err)
+	}
+	q := query.Use(db) // 使用生成的 Query
+	u := q.User
 
 	// 创建（类型安全！）
-	u := q.User
-	u.Create(&model.User{Name: "张三", Age: 25})
+	if err := u.Create(&model.User{Name: "张三", Age: 25}); err != nil {
+		panic(err)
+	}
 
 	// 查询：WHERE name = '张三'
-	users, _ := u.Where(u.Name.Eq("张三")).Find()
+	users, err := u.Where(u.Name.Eq("张三")).Find()
+	if err != nil {
+		panic(err)
+	}
 
 	// 查询：WHERE age > 18 AND status = 'active'
-	users, _ = u.Where(u.Age.Gt(18), u.Status.Eq("active")).Find()
+	users, err = u.Where(u.Age.Gt(18), u.Status.Eq("active")).Find()
+	if err != nil {
+		panic(err)
+	}
 
 	// 排序 + 分页
-	users, _ = u.Where(u.Age.Gt(18)).Order(u.CreatedAt.Desc()).Limit(10).Find()
+	users, err = u.Where(u.Age.Gt(18)).Order(u.CreatedAt.Desc()).Limit(10).Find()
+	if err != nil {
+		panic(err)
+	}
+	_ = users
 
 	// First
-	user, _ := u.Where(u.ID.Eq(1)).First()
+	user, err := u.Where(u.ID.Eq(1)).First()
+	if err != nil {
+		panic(err)
+	}
+	_ = user
 }
 ```
 

@@ -38,7 +38,7 @@ type User struct {
 type CreditCard struct {
 	ID     uint   `gorm:"primaryKey"`
 	Number string
-	UserID uint   `gorm:"uniqueIndex"` // 外键（指向 User）；唯一索引约束每个用户最多一张卡
+	UserID uint   // 外键（指向 User）
 }
 ```
 
@@ -56,7 +56,7 @@ CREATE TABLE credit_cards (
 );
 ```
 
-> 📌 `HasOne` 描述的是 GORM 模型中的关联方向；数据库不会仅凭 Go 字段类型保证一对一。要在数据库层面限制每个 User 最多一张卡，应给 `credit_cards.user_id` 添加 UNIQUE 约束。没有该约束时，模型仍可声明 HasOne，但数据库允许出现多张卡，数据完整性就无法保证。
+> 📌 HasOne 和一的一端需要 UNIQUE 约束来保证"一对一"。否则就是 HasMany（一个 User 可以有多张卡）。
 
 ---
 
@@ -101,16 +101,15 @@ user := User{
 	},
 }
 
-// 写法一：Create 默认会保存非零值 HasOne 关联，并将新 User 的 ID 写入 CreditCard.UserID
-if err := db.Create(&user).Error; err != nil {
-	panic(err)
-}
+// ⚠️ 默认不会自动创建 CreditCard！
+db.Create(&user)
+// 只创建了 User，CreditCard 被忽略
 
-// 写法二：需要显式控制字段时，改用 Select（不要再对同一个 user 重复 Create）
-// err := db.Select("Name", "CreditCard").Create(&user).Error
-
-// Omit("CreditCard") 可跳过关联保存；也可在主记录创建后单独创建子记录
-// 但单独创建时要先确保 CreditCard.UserID 已正确设置。
+// ✅ 用 Select 指定同时创建关联
+db.Select("CreditCard").Create(&user)
+// 或
+db.Create(&user)
+db.Create(&user.CreditCard)  // 手动创建
 ```
 
 ### 全关联保存
@@ -271,21 +270,19 @@ type User struct {
 }
 ```
 
-### 错误3：误以为 Create 默认忽略关联
+### 错误3：创建关联记录时不指定 Select
 
 ```go
 user := User{
-	Name:    "张三",
+	Name: "张三",
 	Profile: Profile{Bio: "工程师"},
 }
+db.Create(&user)
+// ❌ Profile 被忽略了！只有 User 被创建
+// user.Profile.ID = 0
 
-// Create 默认会保存非零值关联；检查返回的 Error 以确认操作成功
-if err := db.Create(&user).Error; err != nil {
-	panic(err)
-}
-
-// 需要控制本次参与创建的字段时，改用 Select 或 Omit，不要重复 Create 同一实例
-// db.Select("Name", "Profile").Create(&user)
+// ✅ 用 Select 或单独创建
+db.Select("Profile").Create(&user)
 ```
 
 ---
